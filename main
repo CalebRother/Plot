@@ -1,0 +1,972 @@
+# Create a single-file, self-contained web app that extends the user's base vision
+# with many more statistical tools. The file can be saved locally and opened in a browser.
+#
+# The app uses WebR (R in the browser via WebAssembly), Handsontable, GoldenLayout, and PapaParse.
+# It includes: CSV import/export, EDA, paired tests, two-sample/ANOVA/Kruskal, correlation,
+# chi-square, linear & logistic regression, PCA, and power analysis for t-tests.
+#
+# The R helper functions are embedded directly to avoid separate file loading.
+
+html = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Plotonium — In‑Browser Stats (WebR)</title>
+
+  <!-- Handsontable -->
+  <script src="https://cdn.jsdelivr.net/npm/handsontable/dist/handsontable.full.min.js"></script>
+  <link href="https://cdn.jsdelivr.net/npm/handsontable/dist/handsontable.full.min.css" rel="stylesheet">
+
+  <!-- PapaParse for CSV -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+
+  <!-- GoldenLayout -->
+  <script type="importmap">
+  {
+    "imports": {
+      "golden-layout": "https://unpkg.com/golden-layout@2.6.0/dist/esm/index.js"
+    }
+  }
+  </script>
+  <link href="https://unpkg.com/golden-layout@2.6.0/dist/css/goldenlayout-base.css" rel="stylesheet">
+  <link href="https://unpkg.com/golden-layout@2.6.0/dist/css/themes/goldenlayout-light-theme.css" rel="stylesheet">
+
+  <style>
+    :root {
+      --border:#ddd;
+      --bg:#fff;
+      --muted:#666;
+      --pad:12px;
+      --radius:10px;
+    }
+    html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    .top-toolbar { background-color: var(--bg); border-bottom: 1px solid var(--border); padding: 0 1em; position: sticky; top:0; z-index:999; }
+    .top-toolbar ul { list-style: none; margin: 0; padding: 0; display: flex; }
+    .top-toolbar a { display: block; padding: 10px 15px; text-decoration: none; color: #333; }
+    .top-toolbar a:hover { background-color: #eee; }
+    .top-toolbar ul ul { display: none; position: absolute; background-color: #fff; border: 1px solid #ddd; min-width: 200px; z-index: 1000; }
+    .top-toolbar li { position: relative; }
+    .top-toolbar li:hover > ul { display: block; }
+
+    #layout-container { width: 100%; height: calc(100% - 41px); }
+    .panel-content { padding: 1em; height: 100%; box-sizing: border-box; overflow: auto; }
+    #spreadsheet-container { width: 100%; height: 100%; }
+
+    pre { background-color: #f7f7f7; padding: 1em; white-space: pre-wrap; word-wrap: break-word; font-size: 0.92em; border-radius: var(--radius); border: 1px solid var(--border); }
+    button, select, input[type="text"], input[type="number"] { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 14px; }
+    button { background: #111; color: #fff; cursor: pointer; }
+    button[disabled] { cursor: not-allowed; background-color: #aaa; }
+    .range-selector { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+    .range-selector label { flex-shrink: 0; width: 120px; color: #222; font-weight: 600; }
+    .range-selector input { flex: 1; }
+    #plot-image { max-width: 100%; height: auto; display: none; margin: 0 0 1em 0; border-radius: var(--radius); border:1px solid var(--border); }
+    #plot-toolbar { display: flex; gap: 10px; margin-bottom: .75em; }
+
+    .analysis-select-container { display: flex; gap: 10px; align-items: center; margin-bottom: 1em; }
+    .analysis-pane { display: none; border: 1px dashed var(--border); border-radius: var(--radius); padding: var(--pad); }
+    .analysis-pane.active { display: block; }
+    .hint { color: var(--muted); font-size: 12px; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); gap: 12px; }
+    .section-title { margin: 12px 0 4px; font-size: 14px; color: #111; font-weight: 700; text-transform: uppercase; letter-spacing: .02em; }
+    .small { font-size: 12px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <nav class="top-toolbar">
+    <ul>
+      <li>
+        <a href="#">File</a>
+        <ul>
+          <li><a href="#" id="import-csv-menu">Import CSV</a></li>
+          <li><a href="#" id="export-csv-menu">Export CSV</a></li>
+          <li><a href="#" id="clear-table-menu">Clear Table</a></li>
+        </ul>
+      </li>
+      <li>
+        <a href="#">Data</a>
+        <ul>
+          <li><a href="#" id="fill-down-menu">Fill Down Selection</a></li>
+          <li><a href="#" id="drop-missing-menu">Drop Rows with Missing</a></li>
+        </ul>
+      </li>
+      <li>
+        <a href="#">Help</a>
+        <ul>
+          <li><a href="#" id="help-about-menu">About</a></li>
+        </ul>
+      </li>
+    </ul>
+  </nav>
+
+  <div id="layout-container"></div>
+
+  <template id="output-panel-template">
+    <div class="panel-content">
+      <div id="plot-toolbar">
+        <button id="download-plot-btn" disabled>Download Plot PNG</button>
+        <button id="download-report-btn" disabled>Download Text Report</button>
+      </div>
+      <img id="plot-image" alt="Statistical plot">
+      <h4>Statistical Output</h4>
+      <pre><code id="stats-output"></code></pre>
+    </div>
+  </template>
+
+  <template id="spreadsheet-panel-template">
+    <div id="spreadsheet-container"></div>
+  </template>
+
+  <template id="controls-panel-template">
+    <div class="panel-content">
+      <div class="analysis-select-container">
+        <label for="analysis-type-select">Analysis:</label>
+        <select id="analysis-type-select">
+          <option value="eda">Exploratory Data Analysis</option>
+          <option value="paired-comparison">Paired Comparison</option>
+          <option value="group-comparison">Two-sample / ANOVA / Kruskal</option>
+          <option value="correlation">Correlation</option>
+          <option value="chi-square">Chi-square / Fisher</option>
+          <option value="linear-regression">Linear Regression (lm)</option>
+          <option value="logistic-regression">Logistic Regression (glm)</option>
+          <option value="pca">PCA</option>
+          <option value="power-ttest">Power — t-test</option>
+        </select>
+      </div>
+
+      <!-- EDA -->
+      <div id="eda" class="analysis-pane active">
+        <h4>Exploratory Data Analysis</h4>
+        <div class="range-selector">
+          <label for="eda-range">Data (one or more columns):</label>
+          <input type="text" id="eda-range" placeholder="e.g., A1:D100"/>
+          <button id="eda-set">Set</button>
+        </div>
+        <div class="grid">
+          <div>
+            <div class="section-title">Plot</div>
+            <div class="range-selector">
+              <label for="eda-plot-type">Type:</label>
+              <select id="eda-plot-type">
+                <option value="hist">Histogram</option>
+                <option value="density">Density</option>
+                <option value="box">Boxplot</option>
+                <option value="qq">Q-Q Plot</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <div class="section-title">Options</div>
+            <div class="range-selector"><label><input type="checkbox" id="eda-normality"/> Shapiro–Wilk test</label></div>
+          </div>
+        </div>
+        <button id="eda-run">Run EDA</button>
+      </div>
+
+      <!-- Paired -->
+      <div id="paired-comparison" class="analysis-pane">
+        <h4>Paired Comparison</h4>
+        <div class="range-selector"><label for="pc-before-range">Before:</label><input type="text" id="pc-before-range" placeholder="A1:A50"><button id="pc-set-before">Set</button></div>
+        <div class="range-selector"><label for="pc-after-range">After:</label><input type="text" id="pc-after-range" placeholder="B1:B50"><button id="pc-set-after">Set</button></div>
+        <div class="range-selector"><label><input type="checkbox" id="pc-parametric"/> Assume normal (t-test)</label></div>
+        <button id="pc-run">Run Paired Test</button>
+      </div>
+
+      <!-- Group / ANOVA / Kruskal -->
+      <div id="group-comparison" class="analysis-pane">
+        <h4>Two-sample / ANOVA / Kruskal</h4>
+        <div class="range-selector"><label for="gc-response">Response (numeric):</label><input type="text" id="gc-response" placeholder="Values e.g., A1:A100"><button id="gc-set-response">Set</button></div>
+        <div class="range-selector"><label for="gc-group1">Group (factor):</label><input type="text" id="gc-group1" placeholder="Group labels e.g., B1:B100"><button id="gc-set-group1">Set</button></div>
+        <div class="range-selector"><label><input type="checkbox" id="gc-parametric"/> Assume normal & equal variance (ANOVA)</label></div>
+        <div class="small">If group has two levels ⇒ t‑test; if ≥3 levels ⇒ ANOVA (or Kruskal–Wallis if not parametric). Post‑hoc: Tukey (ANOVA) or pairwise Wilcoxon.</div>
+        <button id="gc-run">Run Group Test</button>
+      </div>
+
+      <!-- Correlation -->
+      <div id="correlation" class="analysis-pane">
+        <h4>Correlation</h4>
+        <div class="range-selector"><label for="corr-x">X (numeric):</label><input type="text" id="corr-x" placeholder="e.g., A1:A100"><button id="corr-set-x">Set</button></div>
+        <div class="range-selector"><label for="corr-y">Y (numeric):</label><input type="text" id="corr-y" placeholder="e.g., B1:B100"><button id="corr-set-y">Set</button></div>
+        <div class="range-selector">
+          <label for="corr-method">Method:</label>
+          <select id="corr-method">
+            <option value="pearson">Pearson</option>
+            <option value="spearman">Spearman</option>
+          </select>
+        </div>
+        <button id="corr-run">Run Correlation</button>
+      </div>
+
+      <!-- Chi-square -->
+      <div id="chi-square" class="analysis-pane">
+        <h4>Chi-square / Fisher</h4>
+        <div class="range-selector"><label for="chi-a">Categorical A:</label><input type="text" id="chi-a" placeholder="e.g., A1:A100"><button id="chi-set-a">Set</button></div>
+        <div class="range-selector"><label for="chi-b">Categorical B:</label><input type="text" id="chi-b" placeholder="e.g., B1:B100"><button id="chi-set-b">Set</button></div>
+        <div class="small">Automatically chooses Fisher’s exact test when expected counts are small.</div>
+        <button id="chi-run">Run Categorical Test</button>
+      </div>
+
+      <!-- Linear Regression -->
+      <div id="linear-regression" class="analysis-pane">
+        <h4>Linear Regression (lm)</h4>
+        <div class="range-selector"><label for="lm-y">Response (Y):</label><input type="text" id="lm-y" placeholder="e.g., A1:A100"><button id="lm-set-y">Set</button></div>
+        <div class="range-selector">
+          <label for="lm-x">Predictors (X):</label>
+          <input type="text" id="lm-x" placeholder="Comma‑separated ranges, e.g., B1:B100, C1:C100"/>
+          <button id="lm-add-x">Add Selection</button>
+        </div>
+        <div class="small">Produces model summary and 4 standard diagnostic plots.</div>
+        <button id="lm-run">Run Linear Model</button>
+      </div>
+
+      <!-- Logistic Regression -->
+      <div id="logistic-regression" class="analysis-pane">
+        <h4>Logistic Regression (glm, binomial)</h4>
+        <div class="range-selector"><label for="logit-y">Response (0/1):</label><input type="text" id="logit-y" placeholder="e.g., A1:A100"><button id="logit-set-y">Set</button></div>
+        <div class="range-selector">
+          <label for="logit-x">Predictors (X):</label>
+          <input type="text" id="logit-x" placeholder="Comma‑separated ranges, e.g., B1:B100, C1:C100"/>
+          <button id="logit-add-x">Add Selection</button>
+        </div>
+        <div class="small">Outputs coefficients, odds ratios, and a simple classification summary (threshold 0.5).</div>
+        <button id="logit-run">Run Logistic Model</button>
+      </div>
+
+      <!-- PCA -->
+      <div id="pca" class="analysis-pane">
+        <h4>Principal Component Analysis</h4>
+        <div class="range-selector"><label for="pca-x">Matrix (numeric):</label><input type="text" id="pca-x" placeholder="e.g., A1:D200"><button id="pca-set-x">Set</button></div>
+        <div class="range-selector"><label><input type="checkbox" id="pca-scale" checked/> Scale variables</label></div>
+        <button id="pca-run">Run PCA</button>
+      </div>
+
+      <!-- Power -->
+      <div id="power-ttest" class="analysis-pane">
+        <h4>Power — t-test</h4>
+        <div class="grid">
+          <div class="range-selector"><label for="pow-n">n (per group):</label><input type="number" id="pow-n" placeholder="leave blank to solve for n"></div>
+          <div class="range-selector"><label for="pow-delta">Delta (mean diff):</label><input type="number" id="pow-delta" step="any" placeholder="e.g., 5"></div>
+          <div class="range-selector"><label for="pow-sd">SD (sigma):</label><input type="number" id="pow-sd" step="any" placeholder="e.g., 10"></div>
+          <div class="range-selector"><label for="pow-power">Power:</label><input type="number" id="pow-power" step="any" placeholder="e.g., 0.8"></div>
+        </div>
+        <div class="grid">
+          <div class="range-selector">
+            <label for="pow-type">Design:</label>
+            <select id="pow-type">
+              <option value="two.sample">Two-sample</option>
+              <option value="one.sample">One-sample</option>
+              <option value="paired">Paired</option>
+            </select>
+          </div>
+          <div class="range-selector">
+            <label for="pow-alt">Alternative:</label>
+            <select id="pow-alt">
+              <option value="two.sided">Two-sided</option>
+              <option value="one.sided">One-sided</option>
+            </select>
+          </div>
+          <div class="range-selector"><label for="pow-sig">Sig level (α):</label><input type="number" id="pow-sig" step="any" value="0.05"></div>
+        </div>
+        <button id="pow-run">Compute Power / Sample Size</button>
+      </div>
+
+      <div id="status-message" style="margin-top: 1em;"></div>
+    </div>
+  </template>
+
+  <input type="file" id="csv-file-input" accept=".csv" style="display:none"/>
+
+  <script type="module">
+    import { WebR } from 'https://webr.r-wasm.org/latest/webr.mjs';
+    import * as goldenLayout from 'golden-layout';
+
+    let webR, hot, plotImage, statsOutput, statusMessage;
+    let lastSelection = null;
+
+    // ---------- GoldenLayout init ----------
+    const layoutContainer = document.getElementById('layout-container');
+    const layout = new goldenLayout.GoldenLayout(layoutContainer);
+    layout.registerComponentFactoryFunction('output', (container) => {
+      const template = document.getElementById('output-panel-template');
+      container.element.innerHTML = template.innerHTML;
+      plotImage = container.element.querySelector('#plot-image');
+      statsOutput = container.element.querySelector('#stats-output');
+      const dlPlot = container.element.querySelector('#download-plot-btn');
+      const dlReport = container.element.querySelector('#download-report-btn');
+      dlPlot.addEventListener('click', downloadPlot);
+      dlReport.addEventListener('click', downloadReport);
+    });
+    layout.registerComponentFactoryFunction('spreadsheet', (container) => {
+      const template = document.getElementById('spreadsheet-panel-template');
+      container.element.innerHTML = template.innerHTML;
+      const spreadsheetContainer = container.element.querySelector('#spreadsheet-container');
+      hot = new Handsontable(spreadsheetContainer, {
+        startRows: 1000, startCols: 26, rowHeaders: true, colHeaders: true,
+        height: '100%', width: '100%', licenseKey: 'non-commercial-and-evaluation', contextMenu: true
+      });
+      container.on('resize', () => hot.render());
+      hot.updateSettings({
+        afterSelectionEnd: (r, c, r2, c2) => {
+          lastSelection = {
+            startRow: Math.min(r, r2), endRow: Math.max(r, r2),
+            startCol: Math.min(c, c2), endCol: Math.max(c, c2)
+          };
+        }
+      });
+    });
+    layout.registerComponentFactoryFunction('controls', (container) => {
+      const template = document.getElementById('controls-panel-template');
+      container.element.innerHTML = template.innerHTML;
+      statusMessage = container.element.querySelector('#status-message');
+      wireControls(container.element);
+      initWebR();
+    });
+    layout.loadLayout({
+      root: { type: 'column', content: [
+        { type: 'row', height: 65, content: [
+          { type: 'component', componentType: 'output', title: 'Output' },
+          { type: 'component', componentType: 'spreadsheet', title: 'Spreadsheet' }
+        ]},
+        { type: 'component', componentType: 'controls', title: 'Controls', height: 35 }
+      ]}
+    });
+
+    // ---------- Helpers ----------
+    const colName = (c) => {
+      let s = ''; c++;
+      while (c > 0) { const m = (c - 1) % 26; s = String.fromCharCode(65 + m) + s; c = Math.floor((c - 1) / 26); }
+      return s;
+    };
+    const getA1Notation = (sel) => sel ? `${colName(sel.startCol)}${sel.startRow+1}:${colName(sel.endCol)}${sel.endRow+1}` : '';
+    const parseA1 = (str) => {
+      if (!str) return null;
+      const colToIdx = (col) => col.split('').reduce((a, v) => a*26 + v.charCodeAt(0)-64, 0) - 1;
+      const [start, end] = str.toUpperCase().split(':');
+      const m1 = start.match(/^([A-Z]+)(\d+)$/); if (!m1) return null;
+      const sC = colToIdx(m1[1]), sR = parseInt(m1[2],10)-1;
+      if (!end) return { startRow:sR, endRow:sR, startCol:sC, endCol:sC };
+      const m2 = end.match(/^([A-Z]+)(\d+)$/); if (!m2) return null;
+      const eC = colToIdx(m2[1]), eR = parseInt(m2[2],10)-1;
+      return {
+        startRow: Math.min(sR,eR), endRow: Math.max(sR,eR),
+        startCol: Math.min(sC,eC), endCol: Math.max(sC,eC)
+      };
+    };
+    const getDataFromRange = (rangeStr, {asNumeric=false}={}) => {
+      const r = parseA1(rangeStr); if (!r) return [];
+      const data = hot.getData(r.startRow, r.startCol, r.endRow, r.endCol);
+      // flatten by columns (R is column-major; we'll pass vectors per column when needed)
+      const flat = [].concat(...data.map(row => row.map(v => v === null ? '' : v)));
+      if (!asNumeric) return flat;
+      return flat.map(v => (v === '' || v === null) ? NaN : Number(v));
+    };
+    const getMatrixFromRange = (rangeStr) => {
+      const r = parseA1(rangeStr); if (!r) return [];
+      const data = hot.getData(r.startRow, r.startCol, r.endRow, r.endCol);
+      // convert to numeric matrix (NaN where not numeric)
+      return data.map(row => row.map(v => (v === '' || v === null) ? NaN : Number(v)));
+    };
+    function setFromSelection(inputEl) { if (lastSelection) inputEl.value = getA1Notation(lastSelection); }
+
+    function downloadPlot(){
+      const img = plotImage;
+      if (!img || img.style.display === 'none') return;
+      const a = document.createElement('a');
+      a.href = img.src; a.download = 'plotonium-plot.png';
+      a.click();
+    }
+    function downloadReport(){
+      const text = statsOutput?.innerText ?? '';
+      const blob = new Blob([text], {type: 'text/plain'});
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'plotonium-report.txt';
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+
+    // Toolbar wiring
+    document.getElementById('import-csv-menu').addEventListener('click', (e) => {
+      e.preventDefault(); document.getElementById('csv-file-input').click();
+    });
+    document.getElementById('export-csv-menu').addEventListener('click', (e) => {
+      e.preventDefault();
+      const data = hot.getData();
+      const csv = Papa.unparse(data);
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([csv], {type:'text/csv'}));
+      a.download = 'plotonium-data.csv';
+      a.click();
+      URL.revokeObjectURL(a.href);
+    });
+    document.getElementById('clear-table-menu').addEventListener('click', (e) => {
+      e.preventDefault();
+      hot.loadData(Handsontable.helper.createEmptySpreadsheetData(1000, 26));
+    });
+    document.getElementById('csv-file-input').addEventListener('change', (event) => {
+      if (event.target.files.length > 0) {
+        Papa.parse(event.target.files[0], {
+          header: false, skipEmptyLines: true,
+          complete: (res) => hot.loadData(res.data)
+        });
+      }
+      event.target.value = '';
+    });
+    document.getElementById('fill-down-menu').addEventListener('click', (e) => {
+      e.preventDefault();
+      if (!lastSelection) return;
+      const {startRow, endRow, startCol, endCol} = lastSelection;
+      for (let c = startCol; c <= endCol; c++) {
+        const top = hot.getDataAtCell(startRow, c);
+        for (let r = startRow+1; r <= endRow; r++) hot.setDataAtCell(r, c, top);
+      }
+    });
+    document.getElementById('drop-missing-menu').addEventListener('click', (e) => {
+      e.preventDefault();
+      if (!lastSelection) return;
+      const {startRow, endRow, startCol, endCol} = lastSelection;
+      const rowsToKeep = [];
+      for (let r = startRow; r <= endRow; r++) {
+        let keep = true;
+        for (let c = startCol; c <= endCol; c++) {
+          const v = hot.getDataAtCell(r, c);
+          if (v === null || v === '') { keep = false; break; }
+        }
+        if (keep) rowsToKeep.push(r);
+      }
+      // Rebuild the selected block compacted
+      let writeRow = startRow;
+      for (const r of rowsToKeep) {
+        for (let c = startCol; c <= endCol; c++) {
+          hot.setDataAtCell(writeRow, c, hot.getDataAtCell(r, c));
+        }
+        writeRow++;
+      }
+      // Clear the rest
+      for (; writeRow <= endRow; writeRow++) {
+        for (let c = startCol; c <= endCol; c++) hot.setDataAtCell(writeRow, c, '');
+      }
+    });
+    document.getElementById('help-about-menu').addEventListener('click', (e) => {
+      e.preventDefault();
+      alert('Plotonium — In‑Browser Stats powered by WebR. Import CSVs, select ranges (drag in the grid), then use the Controls pane to run analyses. Plots and reports can be downloaded.');
+    });
+
+    // Controls wiring
+    function wireControls(root){
+      const analysisSelect = root.querySelector('#analysis-type-select');
+      analysisSelect.addEventListener('change', (e) => {
+        root.querySelectorAll('.analysis-pane').forEach(p => p.classList.remove('active'));
+        root.querySelector('#' + e.target.value).classList.add('active');
+      });
+      // EDA
+      root.querySelector('#eda-set').addEventListener('click', () => setFromSelection(root.querySelector('#eda-range')));
+      root.querySelector('#eda-run').addEventListener('click', runEDA);
+      // Paired
+      root.querySelector('#pc-set-before').addEventListener('click', () => setFromSelection(root.querySelector('#pc-before-range')));
+      root.querySelector('#pc-set-after').addEventListener('click', () => setFromSelection(root.querySelector('#pc-after-range')));
+      root.querySelector('#pc-run').addEventListener('click', runPaired);
+      // Group
+      root.querySelector('#gc-set-response').addEventListener('click', () => setFromSelection(root.querySelector('#gc-response')));
+      root.querySelector('#gc-set-group1').addEventListener('click', () => setFromSelection(root.querySelector('#gc-group1')));
+      root.querySelector('#gc-run').addEventListener('click', runGroup);
+      // Correlation
+      root.querySelector('#corr-set-x').addEventListener('click', () => setFromSelection(root.querySelector('#corr-x')));
+      root.querySelector('#corr-set-y').addEventListener('click', () => setFromSelection(root.querySelector('#corr-y')));
+      root.querySelector('#corr-run').addEventListener('click', runCorrelation);
+      // Chi
+      root.querySelector('#chi-set-a').addEventListener('click', () => setFromSelection(root.querySelector('#chi-a')));
+      root.querySelector('#chi-set-b').addEventListener('click', () => setFromSelection(root.querySelector('#chi-b')));
+      root.querySelector('#chi-run').addEventListener('click', runChi);
+      // LM
+      root.querySelector('#lm-set-y').addEventListener('click', () => setFromSelection(root.querySelector('#lm-y')));
+      root.querySelector('#lm-add-x').addEventListener('click', () => {
+        const el = root.querySelector('#lm-x'); const add = getA1Notation(lastSelection);
+        if (!add) return;
+        el.value = el.value ? (el.value + ', ' + add) : add;
+      });
+      root.querySelector('#lm-run').addEventListener('click', runLM);
+      // Logistic
+      root.querySelector('#logit-set-y').addEventListener('click', () => setFromSelection(root.querySelector('#logit-y')));
+      root.querySelector('#logit-add-x').addEventListener('click', () => {
+        const el = root.querySelector('#logit-x'); const add = getA1Notation(lastSelection);
+        if (!add) return;
+        el.value = el.value ? (el.value + ', ' + add) : add;
+      });
+      root.querySelector('#logit-run').addEventListener('click', runLogit);
+      // PCA
+      root.querySelector('#pca-set-x').addEventListener('click', () => setFromSelection(root.querySelector('#pca-x')));
+      root.querySelector('#pca-run').addEventListener('click', runPCA);
+      // Power
+      root.querySelector('#pow-run').addEventListener('click', runPowerT);
+    }
+
+    // ---------- WebR bootstrap & R functions ----------
+    async function initWebR(){
+      try {
+        statusMessage.innerText = 'Initializing WebR...';
+        webR = new WebR();
+        await webR.init();
+        statusMessage.innerText = 'Installing R packages (first run can take a minute)...';
+        await webR.evalR("webr::install(c('ggplot2','jsonlite','rstatix','broom'))");
+        statusMessage.innerText = 'Loading R helper functions...';
+        await webR.evalR(rHelpers());
+        statusMessage.innerText = 'Ready.';
+      } catch (err){
+        console.error(err);
+        statusMessage.innerText = 'Initialization error: ' + err.message;
+      }
+    }
+
+    function rHelpers(){
+      // Language=R
+      return `
+suppressMessages({
+  library(ggplot2); library(broom); library(rstatix); library(jsonlite)
+})
+
+# Utilities ----
+to_num <- function(x) suppressWarnings(as.numeric(x))
+is_all_numeric <- function(v) all(!is.na(suppressWarnings(as.numeric(v))))
+
+clean_vec <- function(v){
+  v[v == ""] <- NA
+  v
+}
+
+vec_from_js <- function(js_json) { # js_json is a JSON string of a JS array
+  unlist(fromJSON(js_json), use.names = FALSE)
+}
+
+matrix_from_js <- function(js_json) {
+  m <- fromJSON(js_json)
+  # Convert to numeric, keep NA for non-numeric
+  storage.mode(m) <- "double"
+  m
+}
+
+# EDA ----
+eda_summary <- function(x, plot_type="hist", do_shapiro=FALSE) {
+  x <- clean_vec(x)
+  x <- to_num(x)
+  x <- x[!is.na(x)]
+
+  out <- list()
+  out$summary <- capture.output({
+    cat("N:", length(x), "\\n")
+    cat("Mean:", mean(x), "\\n")
+    cat("SD:", sd(x), "\\n")
+    cat("Median:", median(x), "\\n")
+    q <- quantile(x, probs=c(.25,.75), na.rm=TRUE)
+    cat("IQR:", q[2]-q[1], "\\n")
+  })
+
+  p <- NULL
+  if (plot_type == "hist") {
+    p <- ggplot(data.frame(x=x), aes(x)) + geom_histogram(bins=30) + theme_minimal()
+  } else if (plot_type == "density") {
+    p <- ggplot(data.frame(x=x), aes(x)) + geom_density() + theme_minimal()
+  } else if (plot_type == "box") {
+    p <- ggplot(data.frame(x=x), aes(y=x, x=factor(1))) + geom_boxplot() + theme_minimal() + xlab("")
+  } else if (plot_type == "qq") {
+    qq <- qqnorm(x, plot.it=FALSE); qqline <- qqline(x, datax=FALSE)
+    p <- ggplot(data.frame(theoretical=qq[[1]], sample=qq[[2]]), aes(theoretical, sample)) +
+      geom_point() + geom_abline(slope=1, intercept=0) + theme_minimal()
+  }
+
+  if (do_shapiro && length(x) >= 3 && length(x) <= 5000) {
+    st <- shapiro.test(x)
+    out$summary <- c(out$summary, "", capture.output(print(st)))
+  }
+
+  list(plot=p, text=paste(out$summary, collapse="\\n"))
+}
+
+# Paired comparison ----
+paired_comparison <- function(before, after, parametric=TRUE){
+  before <- to_num(clean_vec(before)); after <- to_num(clean_vec(after))
+  stopifnot(length(before) == length(after))
+  df <- data.frame(before=before, after=after, diff=after-before)
+  res_text <- c()
+
+  if (parametric) {
+    tt <- t.test(df$before, df$after, paired=TRUE)
+    res_text <- c(res_text, capture.output(print(tt)))
+    eff <- df %>% cohens_d(after ~ 1, mu = before) # not the right signature; fallback below
+  } else {
+    wt <- wilcox.test(df$before, df$after, paired=TRUE)
+    res_text <- c(res_text, capture.output(print(wt)))
+  }
+
+  # Basic plot: paired lines
+  p <- ggplot(tidyr::pivot_longer(df, c(before,after), names_to="time", values_to="val"),
+              aes(x=time, y=val, group=row_number())) +
+       geom_line(alpha=.3) + geom_point() + theme_minimal()
+
+  list(plot=p, text=paste(res_text, collapse="\\n"))
+}
+
+# Group comparison (two-sample or ANOVA / Kruskal) ----
+group_comparison <- function(response, group, parametric=TRUE){
+  response <- to_num(clean_vec(response))
+  group <- factor(clean_vec(group))
+  keep <- !is.na(response) & !is.na(group)
+  response <- response[keep]; group <- droplevels(group[keep])
+
+  k <- nlevels(group)
+  res_text <- c(sprintf("Groups: %d levels (%s)", k, paste(levels(group), collapse=", ")))
+
+  if (k == 2) {
+    if (parametric) {
+      tt <- t.test(response ~ group, var.equal=FALSE) # Welch by default
+      res_text <- c(res_text, capture.output(print(tt)))
+      p <- ggplot(data.frame(group, response), aes(group, response)) + geom_boxplot() + theme_minimal()
+      return(list(plot=p, text=paste(res_text, collapse="\\n")))
+    } else {
+      wt <- wilcox.test(response ~ group, exact=FALSE)
+      res_text <- c(res_text, capture.output(print(wt)))
+      p <- ggplot(data.frame(group, response), aes(group, response)) + geom_boxplot() + theme_minimal()
+      return(list(plot=p, text=paste(res_text, collapse="\\n")))
+    }
+  } else if (k >= 3) {
+    if (parametric) {
+      fit <- aov(response ~ group)
+      ares <- summary(fit)
+      res_text <- c(res_text, capture.output(ares))
+      # Tukey post-hoc
+      tuk <- TukeyHSD(fit)
+      res_text <- c(res_text, "", "Post-hoc: Tukey HSD", capture.output(tuk))
+      p <- ggplot(data.frame(group, response), aes(group, response)) + geom_boxplot() + theme_minimal()
+      return(list(plot=p, text=paste(res_text, collapse="\\n")))
+    } else {
+      kw <- kruskal.test(response ~ group)
+      res_text <- c(res_text, capture.output(print(kw)))
+      # Pairwise Wilcoxon
+      pw <- pairwise.wilcox.test(response, group, p.adjust.method="BH")
+      res_text <- c(res_text, "", "Pairwise Wilcoxon (BH adjust):", capture.output(pw))
+      p <- ggplot(data.frame(group, response), aes(group, response)) + geom_boxplot() + theme_minimal()
+      return(list(plot=p, text=paste(res_text, collapse="\\n")))
+    }
+  }
+  list(plot=NULL, text="Not enough groups / data.")
+}
+
+# Correlation ----
+correlation_test <- function(x, y, method="pearson"){
+  x <- to_num(clean_vec(x)); y <- to_num(clean_vec(y))
+  keep <- !is.na(x) & !is.na(y)
+  x <- x[keep]; y <- y[keep]
+  ct <- cor.test(x, y, method=method)
+  p <- ggplot(data.frame(x=x,y=y), aes(x,y)) + geom_point(alpha=.7) + geom_smooth(method='lm', se=FALSE) + theme_minimal()
+  list(plot=p, text=paste(capture.output(print(ct)), collapse="\\n"))
+}
+
+# Chi-square / Fisher ----
+cat_test <- function(a, b){
+  a <- clean_vec(a); b <- clean_vec(b)
+  keep <- !is.na(a) & !is.na(b)
+  a <- factor(a[keep]); b <- factor(b[keep])
+  tab <- table(a,b)
+  use_fisher <- any(chisq.test(tab)$expected < 5)
+  if (use_fisher) {
+    ft <- fisher.test(tab)
+    txt <- c("Fisher's exact test (small expected counts detected):", capture.output(print(ft)))
+  } else {
+    ct <- chisq.test(tab, correct=FALSE)
+    txt <- c("Chi-square test:", capture.output(print(ct)))
+  }
+  # Mosaic-like bar plot
+  df <- as.data.frame(tab)
+  p <- ggplot(df, aes(x=a, y=Freq, fill=b)) + geom_col(position="fill") + ylab("Proportion") + theme_minimal()
+  list(plot=p, text=paste(txt, collapse="\\n"))
+}
+
+# Linear model ----
+lm_fit <- function(y, x_mat){
+  y <- to_num(clean_vec(y)); x_mat <- apply(x_mat, 2, to_num)
+  keep <- !is.na(y) & apply(x_mat, 1, function(r) all(!is.na(r)))
+  y <- y[keep]; x_mat <- x_mat[keep,, drop=FALSE]
+  df <- as.data.frame(x_mat); colnames(df) <- paste0("X", seq_len(ncol(df)))
+  fit <- lm(y ~ ., data=df)
+  summ <- summary(fit)
+  txt <- capture.output(summ)
+  # Base R 2x2 diagnostic plots
+  png(filename="webr_png_plot.png", width=800, height=600)
+  par(mfrow=c(2,2)); plot(fit)
+  dev.off()
+  list(plot=ggplot()+theme_void(), text=paste(txt, collapse="\\n"))
+}
+
+# Logistic model ----
+logit_fit <- function(y, x_mat){
+  y <- to_num(clean_vec(y)); x_mat <- apply(x_mat, 2, to_num)
+  keep <- !is.na(y) & apply(x_mat, 1, function(r) all(!is.na(r)))
+  y <- y[keep]; x_mat <- x_mat[keep,, drop=FALSE]
+  df <- as.data.frame(x_mat); colnames(df) <- paste0("X", seq_len(ncol(df)))
+  df$Y <- as.factor(ifelse(y >= 0.5, 1, 0))
+  fit <- glm(Y ~ ., data=df, family=binomial())
+  summ <- summary(fit)
+  or <- exp(coef(fit))
+  txt <- c(capture.output(summ), "", "Odds Ratios:", capture.output(print(or)))
+  # Simple classification at 0.5
+  probs <- fitted(fit)
+  pred <- ifelse(probs >= 0.5, 1, 0)
+  acc <- mean(pred == as.numeric(as.character(df$Y)))
+  txt <- c(txt, "", sprintf("Accuracy (0.5 threshold): %.3f", acc))
+  # Plot: probability vs. ordered index
+  p <- ggplot(data.frame(p=probs, y=as.numeric(as.character(df$Y))), aes(seq_along(p), p, color=factor(y))) +
+       geom_point() + theme_minimal() + xlab("Index") + ylab("Predicted Prob")
+  list(plot=p, text=paste(txt, collapse="\\n"))
+}
+
+# PCA ----
+pca_run <- function(x_mat, scale.=TRUE){
+  x_mat <- apply(x_mat, 2, to_num)
+  x_mat <- x_mat[apply(x_mat, 1, function(r) all(!is.na(r))), , drop=FALSE]
+  pc <- prcomp(x_mat, scale.=scale.)
+  sdev2 <- pc$sdev^2; var_expl <- sdev2 / sum(sdev2)
+  df <- data.frame(PC=seq_along(var_expl), VarExp=var_expl)
+  p <- ggplot(df, aes(PC, VarExp)) + geom_col() + theme_minimal() + ylab("Variance explained")
+  txt <- capture.output(summary(pc))
+  list(plot=p, text=paste(txt, collapse="\\n"))
+}
+
+# Power t-test ----
+power_t_calc <- function(n=NULL, delta=NULL, sd=NULL, power=NULL, sig.level=0.05, type="two.sample", alternative="two.sided"){
+  res <- power.t.test(n=n, delta=delta, sd=sd, power=power, sig.level=sig.level, type=type, alternative=alternative)
+  list(plot=NULL, text=paste(capture.output(res), collapse="\\n"))
+}
+`;
+    }
+
+    // ---------- Core analysis runners ----------
+    async function capturePlotAndText(result){
+      // result is webR.captureR output with images & console text
+      const imgCanvas = result.images[0];
+      const outText = result.output.filter(o => o.type !== 'stderr').map(o => o.data).join('\n').trim();
+      statsOutput.innerText = outText;
+      // resize plot to container width
+      const container = plotImage.parentElement;
+      const style = window.getComputedStyle(container);
+      const paddingX = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+      const availableWidth = container.clientWidth - paddingX;
+      if (imgCanvas) {
+        let targetWidth = imgCanvas.width, targetHeight = imgCanvas.height;
+        if (imgCanvas.width > availableWidth) {
+          const aspect = imgCanvas.height / imgCanvas.width;
+          targetWidth = availableWidth; targetHeight = availableWidth * aspect;
+        }
+        const temp = document.createElement('canvas');
+        temp.width = targetWidth; temp.height = targetHeight;
+        const ctx = temp.getContext('2d');
+        ctx.drawImage(imgCanvas, 0, 0, targetWidth, targetHeight);
+        plotImage.src = temp.toDataURL();
+        plotImage.style.display = 'block';
+        document.getElementById('download-plot-btn').disabled = false;
+      } else {
+        plotImage.style.display = 'none';
+        document.getElementById('download-plot-btn').disabled = true;
+      }
+      document.getElementById('download-report-btn').disabled = (outText.length === 0);
+    }
+
+    async function runEDA(){
+      const range = document.querySelector('#eda-range').value.trim();
+      if (!range) { alert('Select a range.'); return; }
+      const plotType = document.querySelector('#eda-plot-type').value;
+      const doShap = document.querySelector('#eda-normality').checked;
+      statusMessage.innerText = 'Running EDA...';
+      const data = getDataFromRange(range);
+      const shelter = await new webR.Shelter();
+      try {
+        await shelter.evalR(`x_vals <- jsonlite::fromJSON(${JSON.stringify(JSON.stringify(data))})`);
+        const cmd = `res <- eda_summary(x_vals, plot_type="${plotType}", do_shapiro=${doShap ? 'TRUE':'FALSE'});
+                     print(res$text); if (!is.null(res$plot)) print(res$plot)`;
+        const result = await shelter.captureR(cmd);
+        await capturePlotAndText(result);
+        statusMessage.innerText = 'Done.';
+      } catch (e){ console.error(e); statusMessage.innerText = 'Error: ' + e.message; }
+      finally { await shelter.purge(); }
+    }
+
+    async function runPaired(){
+      const beforeR = document.querySelector('#pc-before-range').value.trim();
+      const afterR  = document.querySelector('#pc-after-range').value.trim();
+      if (!beforeR || !afterR) { alert('Set both ranges.'); return; }
+      const param = document.querySelector('#pc-parametric').checked;
+      statusMessage.innerText = 'Running paired test...';
+      const before = getDataFromRange(beforeR); const after = getDataFromRange(afterR);
+      const shelter = await new webR.Shelter();
+      try {
+        await shelter.evalR(`before <- jsonlite::fromJSON(${JSON.stringify(JSON.stringify(before))})`);
+        await shelter.evalR(`after  <- jsonlite::fromJSON(${JSON.stringify(JSON.stringify(after))})`);
+        const cmd = `res <- paired_comparison(before, after, parametric=${param ? 'TRUE':'FALSE'});
+                     print(res$text); if (!is.null(res$plot)) print(res$plot)`;
+        const result = await shelter.captureR(cmd);
+        await capturePlotAndText(result);
+        statusMessage.innerText = 'Done.';
+      } catch(e){ console.error(e); statusMessage.innerText = 'Error: ' + e.message; }
+      finally { await shelter.purge(); }
+    }
+
+    async function runGroup(){
+      const respR = document.querySelector('#gc-response').value.trim();
+      const grpR  = document.querySelector('#gc-group1').value.trim();
+      if (!respR || !grpR) { alert('Set response and group.'); return; }
+      const param = document.querySelector('#gc-parametric').checked;
+      statusMessage.innerText = 'Running group test...';
+      const resp = getDataFromRange(respR);
+      const grp  = getDataFromRange(grpR);
+      const shelter = await new webR.Shelter();
+      try {
+        await shelter.evalR(`response <- jsonlite::fromJSON(${JSON.stringify(JSON.stringify(resp))})`);
+        await shelter.evalR(`group    <- jsonlite::fromJSON(${JSON.stringify(JSON.stringify(grp))})`);
+        const cmd = `res <- group_comparison(response, group, parametric=${param ? 'TRUE':'FALSE'});
+                     print(res$text); if (!is.null(res$plot)) print(res$plot)`;
+        const result = await shelter.captureR(cmd);
+        await capturePlotAndText(result);
+        statusMessage.innerText = 'Done.';
+      } catch(e){ console.error(e); statusMessage.innerText = 'Error: ' + e.message; }
+      finally { await shelter.purge(); }
+    }
+
+    async function runCorrelation(){
+      const xr = document.querySelector('#corr-x').value.trim();
+      const yr = document.querySelector('#corr-y').value.trim();
+      if (!xr || !yr) { alert('Set X and Y.'); return; }
+      const method = document.querySelector('#corr-method').value;
+      statusMessage.innerText = 'Running correlation...';
+      const xv = getDataFromRange(xr);
+      const yv = getDataFromRange(yr);
+      const shelter = await new webR.Shelter();
+      try {
+        await shelter.evalR(`x <- jsonlite::fromJSON(${JSON.stringify(JSON.stringify(xv))})`);
+        await shelter.evalR(`y <- jsonlite::fromJSON(${JSON.stringify(JSON.stringify(yv))})`);
+        const cmd = `res <- correlation_test(x, y, method="${method}");
+                     print(res$text); if (!is.null(res$plot)) print(res$plot)`;
+        const result = await shelter.captureR(cmd);
+        await capturePlotAndText(result);
+        statusMessage.innerText = 'Done.';
+      } catch(e){ console.error(e); statusMessage.innerText = 'Error: ' + e.message; }
+      finally { await shelter.purge(); }
+    }
+
+    async function runChi(){
+      const ar = document.querySelector('#chi-a').value.trim();
+      const br = document.querySelector('#chi-b').value.trim();
+      if (!ar || !br) { alert('Set both categorical ranges.'); return; }
+      statusMessage.innerText = 'Running categorical test...';
+      const av = getDataFromRange(ar);
+      const bv = getDataFromRange(br);
+      const shelter = await new webR.Shelter();
+      try {
+        await shelter.evalR(`a <- jsonlite::fromJSON(${JSON.stringify(JSON.stringify(av))})`);
+        await shelter.evalR(`b <- jsonlite::fromJSON(${JSON.stringify(JSON.stringify(bv))})`);
+        const cmd = `res <- cat_test(a, b);
+                     print(res$text); if (!is.null(res$plot)) print(res$plot)`;
+        const result = await shelter.captureR(cmd);
+        await capturePlotAndText(result);
+        statusMessage.innerText = 'Done.';
+      } catch(e){ console.error(e); statusMessage.innerText = 'Error: ' + e.message; }
+      finally { await shelter.purge(); }
+    }
+
+    async function runLM(){
+      const yr = document.querySelector('#lm-y').value.trim();
+      const xr = document.querySelector('#lm-x').value.trim();
+      if (!yr || !xr) { alert('Set Y and at least one X range.'); return; }
+      statusMessage.innerText = 'Running linear model...';
+      const y = getDataFromRange(yr);
+      // Build matrix from multiple ranges
+      const ranges = xr.split(',').map(s => s.trim()).filter(Boolean);
+      let mat = [];
+      for (const rg of ranges){
+        const col = getDataFromRange(rg, {asNumeric:false});
+        if (mat.length === 0) mat = col.map(v => [v]); else mat.forEach((row,i) => row.push(col[i]));
+      }
+      const shelter = await new webR.Shelter();
+      try {
+        await shelter.evalR(`y  <- jsonlite::fromJSON(${JSON.stringify(JSON.stringify(y))})`);
+        await shelter.evalR(`xm <- jsonlite::fromJSON(${JSON.stringify(JSON.stringify(mat))})`);
+        const cmd = `res <- lm_fit(y, xm);
+                     cat(res$text)`; // diagnostic plots are written via base graphics to PNG; WebR can't capture multi-plots easily
+        const result = await shelter.captureR(cmd);
+        // no ggplot image returned for base plots; just text
+        await capturePlotAndText(result);
+        statusMessage.innerText = 'Done (text summary; diagnostics not embedded).';
+      } catch(e){ console.error(e); statusMessage.innerText = 'Error: ' + e.message; }
+      finally { await shelter.purge(); }
+    }
+
+    async function runLogit(){
+      const yr = document.querySelector('#logit-y').value.trim();
+      const xr = document.querySelector('#logit-x').value.trim();
+      if (!yr || !xr) { alert('Set Y and at least one X range.'); return; }
+      statusMessage.innerText = 'Running logistic model...';
+      const y = getDataFromRange(yr);
+      const ranges = xr.split(',').map(s => s.trim()).filter(Boolean);
+      let mat = [];
+      for (const rg of ranges){
+        const col = getDataFromRange(rg, {asNumeric:false});
+        if (mat.length === 0) mat = col.map(v => [v]); else mat.forEach((row,i) => row.push(col[i]));
+      }
+      const shelter = await new webR.Shelter();
+      try {
+        await shelter.evalR(`y  <- jsonlite::fromJSON(${JSON.stringify(JSON.stringify(y))})`);
+        await shelter.evalR(`xm <- jsonlite::fromJSON(${JSON.stringify(JSON.stringify(mat))})`);
+        const cmd = `res <- logit_fit(y, xm);
+                     print(res$text); if (!is.null(res$plot)) print(res$plot)`;
+        const result = await shelter.captureR(cmd);
+        await capturePlotAndText(result);
+        statusMessage.innerText = 'Done.';
+      } catch(e){ console.error(e); statusMessage.innerText = 'Error: ' + e.message; }
+      finally { await shelter.purge(); }
+    }
+
+    async function runPCA(){
+      const xr = document.querySelector('#pca-x').value.trim();
+      const scale = document.querySelector('#pca-scale').checked;
+      if (!xr) { alert('Set a numeric matrix range.'); return; }
+      statusMessage.innerText = 'Running PCA...';
+      const mat = getMatrixFromRange(xr);
+      const shelter = await new webR.Shelter();
+      try {
+        await shelter.evalR(`xm <- jsonlite::fromJSON(${JSON.stringify(JSON.stringify(mat))})`);
+        const cmd = `res <- pca_run(xm, scale.=${scale ? 'TRUE':'FALSE'});
+                     print(res$text); if (!is.null(res$plot)) print(res$plot)`;
+        const result = await shelter.captureR(cmd);
+        await capturePlotAndText(result);
+        statusMessage.innerText = 'Done.';
+      } catch(e){ console.error(e); statusMessage.innerText = 'Error: ' + e.message; }
+      finally { await shelter.purge(); }
+    }
+
+    async function runPowerT(){
+      const n     = document.querySelector('#pow-n').value;
+      const delta = document.querySelector('#pow-delta').value;
+      const sd    = document.querySelector('#pow-sd').value;
+      const pow   = document.querySelector('#pow-power').value;
+      const type  = document.querySelector('#pow-type').value;
+      const alt   = document.querySelector('#pow-alt').value;
+      const sig   = parseFloat(document.querySelector('#pow-sig').value || '0.05');
+      statusMessage.innerText = 'Computing power...';
+      const shelter = await new webR.Shelter();
+      function nv(x){ return x ? x : 'NULL'; }
+      try {
+        const cmd = `res <- power_t_calc(n=${nv(n)}, delta=${nv(delta)}, sd=${nv(sd)}, power=${nv(pow)}, sig.level=${sig}, type="${type}", alternative="${alt}"); cat(res$text)`;
+        const result = await shelter.captureR(cmd);
+        await capturePlotAndText(result);
+        statusMessage.innerText = 'Done.';
+      } catch(e){ console.error(e); statusMessage.innerText = 'Error: ' + e.message; }
+      finally { await shelter.purge(); }
+    }
+  </script>
+</body>
+</html>
+"""
+
+path = "/mnt/data/plotonium_all_in_one.html"
+with open(path, "w", encoding="utf-8") as f:
+    f.write(html)
+
+path
